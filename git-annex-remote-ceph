@@ -1,0 +1,222 @@
+#!/usr/bin/env python
+import rados
+import os
+import sys
+import logging
+
+conf = {}
+cluster = None
+ioctx = None
+cephIOChunkSize = 8388608 # 8MB
+
+try:
+    DEBUG = int(os.getenv("GIT_ANNEX_REMOTE_CEPH_DEBUG") or 0)
+except:
+    DEBUG = 0
+
+if DEBUG:
+    logger = logging.getLogger('git-annex-remote-ceph')
+    logger.setLevel(logging.DEBUG)
+    handler = logging.FileHandler('/tmp/git-annex-remote-ceph.log', encoding='UTF-8')
+    logger.addHandler(handler)
+
+
+def logthis(level):
+    def _decorator(fn):
+        def _decorated(*arg, **kwargs):
+            if kwargs:
+                logger.log(level, "calling %s(%r,%r)", fn.func_name, arg, kwargs)
+                ret = fn(*arg, **kwargs)
+                logger.log(level, "called %s(%r,%r) got return value: %r", fn.func_name, arg, kwargs, ret)
+            else:
+                logger.log(level, "calling %s(%r)", fn.func_name, arg)
+                ret = fn(*arg)
+                logger.log(level, "called %s(%r) got return value: %r", fn.func_name, arg, ret)
+            return ret
+
+        if DEBUG:
+            return _decorated
+        else:
+            return fn
+    return _decorator
+
+
+@logthis(logging.DEBUG)
+def cpFromCeph(fname, full_key):
+    offset = 0
+    with open(os.path.join(os.getcwd(), fname), 'w') as f:
+        data = ioctx.read(full_key, length=cephIOChunkSize, offset=offset)
+        while data:
+            f.write(data)
+            offset += len(data)
+            data = ioctx.read(full_key, length=cephIOChunkSize, offset=offset)
+
+
+@logthis(logging.DEBUG)
+def cpToCeph(fname, full_key):
+    with open(os.path.join(os.getcwd(), fname), 'r') as f:
+        ioctx.set_xattr(full_key, 'transfering', 'true')
+        ioctx.write(full_key, '')
+        for chunk in iter(lambda: f.read(cephIOChunkSize), ''):
+            ioctx.append(full_key, chunk)
+    ioctx.rm_xattr(full_key, 'transfering')
+
+
+@logthis(logging.DEBUG)
+def read():
+    line = sys.stdin.readline()
+    return line
+
+
+@logthis(logging.DEBUG)
+def write(line):
+    try:
+        sys.stdout.write(line+"\n")
+        sys.stdout.flush()
+    except IOError:
+        pass
+
+
+@logthis(logging.DEBUG)
+def _getconfig(arg):
+    write('GETCONFIG %s' % arg)
+    conf[arg] = read().rstrip('\n').replace('VALUE ', '')
+
+
+@logthis(logging.DEBUG)
+def _setconfig(key, val=''):
+    if not val:
+        val = conf[key]
+    write('SETCONFIG {k} {v}'.format(k=key, v=val))
+
+
+@logthis(logging.DEBUG)
+def initremote(args):
+    _getconfig('rados_id')
+    _setconfig('rados_id')
+    _getconfig('pool_name')
+    _setconfig('pool_name')
+    _getconfig('ceph_conffile')
+    _setconfig('ceph_conffile')
+    _getconfig('key_prefix')
+    if not conf['key_prefix']:
+        conf['key_prefix'] = 'annex-'
+    _setconfig('key_prefix')
+    write('INITREMOTE-SUCCESS')
+
+
+@logthis(logging.DEBUG)
+def prepare(args):
+    global cluster
+    global ioctx
+
+    _getconfig('rados_id')
+    _getconfig('pool_name')
+    _getconfig('ceph_conffile')
+    _getconfig('key_prefix')
+
+    cluster = rados.Rados(rados_id=conf['rados_id'], conffile=conf['ceph_conffile'])
+    cluster.connect()
+    ioctx = cluster.open_ioctx(conf['pool_name'])
+    write('PREPARE-SUCCESS')
+
+
+@logthis(logging.DEBUG)
+def _shutdown():
+    global cluster
+    global ioctx
+    if ioctx:
+        ioctx.close()
+        ioctx = None
+    if cluster:
+        cluster.shutdown()
+        cluster = None
+
+
+@logthis(logging.DEBUG)
+def remove(args):
+    try:
+        val = ioctx.remove_object(conf['key_prefix'] + args[0])
+        if val:
+            write('REMOVE-SUCCESS %s' %args[0])
+        else:
+            write('REMOVE-FAILURE %s unable to remove object' %args[0])
+    except rados.ObjectNotFound as e:
+        write('REMOVE-SUCCESS %s' %args[0])
+
+
+@logthis(logging.DEBUG)
+def getcost(args):
+    write('COST 140')
+
+
+@logthis(logging.DEBUG)
+def getavailability(args):
+    write('AVAILABILITY LOCAL')
+
+
+@logthis(logging.DEBUG)
+def _stat(full_key):
+    try:
+        return ioctx.stat(full_key)
+    except rados.ObjectNotFound:
+        pass
+
+
+def _get_xattr(full_key, attr):
+    try:
+        return ioctx.get_xattr(full_key, attr)
+    except rados.NoData:
+        pass
+
+
+@logthis(logging.DEBUG)
+def checkpresent(args):
+    if not _stat(conf['key_prefix'] + args[0]) or _get_xattr(conf['key_prefix'] + args[0], 'transfering'):
+        write('CHECKPRESENT-FAILURE %s' %args[0])
+    else:
+        write('CHECKPRESENT-SUCCESS %s' %args[0])
+
+
+@logthis(logging.DEBUG)
+def transfer(args):
+    if args[0] == 'STORE':
+        if _stat(conf['key_prefix'] + args[1]):
+            write('TRANSFER-SUCCESS STORE %s' %args[1])
+        else:
+            try:
+                cpToCeph(args[2], conf['key_prefix'] + args[1])
+                write('TRANSFER-SUCCESS STORE %s' %args[1])
+            except IOError as e:
+                write('TRANSFER-FAILURE STORE %s %s' %(args[1], e.message))
+    elif args[0] == 'RETRIEVE':
+        cpFromCeph(args[2], conf['key_prefix'] + args[1])
+        write('TRANSFER-SUCCESS RETRIEVE %s' %args[1])
+
+
+@logthis(logging.DEBUG)
+def unknown(cmd, args):
+    write('UNSUPPORTED-REQUEST')
+
+
+@logthis(logging.DEBUG)
+def main():
+    write('VERSION 1')
+    line = ' '
+    while line:
+        line = read()
+        command = line.rstrip('\n').split(' ')[0].lower()
+        args = line.rstrip('\n').split(' ')[1:]
+        func = globals().get(command, None)
+        if func:
+            func(args)
+        else:
+            if command:
+                unknown(command, args)
+            else:
+                write('')
+                _shutdown()
+
+
+if __name__ == '__main__':
+    main()
